@@ -7,23 +7,26 @@ import string
 import pickle
 import os
 from tqdm import tqdm
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils import shuffle, class_weight
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 
-# Load dan preprocessing
+# Load dan Preprocessing
 df = pd.read_csv("PRDECT-ID Dataset.csv")
 print(df['Emotion'].value_counts())
 
+# Stopwords
 factory = StopWordRemoverFactory()
 stopwords_id = set(factory.get_stop_words())
+extra_stopwords = {'nya', 'kok', 'sih', 'deh', 'dong', 'mah'}
+stopwords_id.update(extra_stopwords)
 
 def clean_text(text):
     text = text.lower()
     text = re.sub(r'\d+', '', text)
-    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = re.sub(r'[^a-zA-Z\s]', '', text)  # Buang karakter non-huruf
     tokens = text.split()
     tokens = [word for word in tokens if word not in stopwords_id]
     return ' '.join(tokens)
@@ -37,15 +40,16 @@ y = df['Emotion']
 X_train_val, X_test, y_train_val, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y)
 
-vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
+vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=10000)
 X_train_val_vectorized = vectorizer.fit_transform(X_train_val)
 X_test_vectorized = vectorizer.transform(X_test)
 
 os.makedirs('saved_models', exist_ok=True)
 with open('vectorizer.pkl', 'wb') as f:
-        pickle.dump(vectorizer, f)
+    pickle.dump(vectorizer, f)
 print("Vectorizer saved as 'vectorizer.pkl'")
 
+# Custom SVM
 class CustomSVM:
     def __init__(self, lr=0.005, lambda_param=0.01, n_iters=3000, class_weights=None):
         self.lr = lr
@@ -69,8 +73,7 @@ class CustomSVM:
 
                 weight = 1.0
                 if self.class_weights is not None:
-                    label = 1 if y[idx] == 1 else 0
-                    weight = self.class_weights.get(label, 1.0)
+                    weight = self.class_weights.get(y[idx], 1.0)
 
                 if condition:
                     self.w -= self.lr * (2 * self.lambda_param * self.w)
@@ -98,13 +101,14 @@ def save_model(model, path):
             'n_iters': model.n_iters
         }, f)
 
-kf = KFold(n_splits=10, shuffle=True, random_state=42)
+# Stratified K-Fold
+kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 all_y_true = []
 all_y_pred = []
 best_models_per_label = {}
 best_params_per_label = {}
 
-for fold, (train_index, val_index) in enumerate(kf.split(X_train_val_vectorized)):
+for fold, (train_index, val_index) in enumerate(kf.split(X_train_val_vectorized, y_train_val)):
     print(f"\n==== Fold {fold + 1} ====")
     X_train, X_val = X_train_val_vectorized[train_index], X_train_val_vectorized[val_index]
     y_train, y_val = y_train_val.iloc[train_index], y_train_val.iloc[val_index]
@@ -117,16 +121,17 @@ for fold, (train_index, val_index) in enumerate(kf.split(X_train_val_vectorized)
             best_score = -np.inf
             best_params = None
             param_grid = [
-                {'lr': 0.001, 'lambda_param': 0.01, 'n_iters': 10},
-                {'lr': 0.005, 'lambda_param': 0.01, 'n_iters': 10},
-                {'lr': 0.01, 'lambda_param': 0.001, 'n_iters': 10}
+                {'lr': 0.001, 'lambda_param': 0.01, 'n_iters': 100},
+                {'lr': 0.005, 'lambda_param': 0.01, 'n_iters': 100},
+                {'lr': 0.01, 'lambda_param': 0.001, 'n_iters': 100}
             ]
             y_binary = np.where(y_train == label, 1, 0)
             weights = class_weight.compute_class_weight(class_weight='balanced', classes=np.array([0, 1]), y=y_binary)
             class_weights_dict = {0: weights[0], 1: weights[1]}
 
             for params in param_grid:
-                clf = CustomSVM(lr=params['lr'], lambda_param=params['lambda_param'], n_iters=params['n_iters'], class_weights=class_weights_dict)
+                clf = CustomSVM(lr=params['lr'], lambda_param=params['lambda_param'],
+                                n_iters=params['n_iters'], class_weights=class_weights_dict)
                 clf.fit(X_train, y_binary)
                 val_preds = np.where(clf.decision_function(X_val) >= 0, 1, 0)
                 acc = np.mean(val_preds == np.where(y_val == label, 1, 0))
@@ -147,20 +152,20 @@ print(classification_report(all_y_true, all_y_pred))
 
 cm = confusion_matrix(all_y_true, all_y_pred, labels=np.unique(y_train_val))
 plt.figure(figsize=(8, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=np.unique(y_train_val), yticklabels=np.unique(y_train_val))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=np.unique(y_train_val),
+            yticklabels=np.unique(y_train_val))
 plt.xlabel('Predicted')
 plt.ylabel('True')
 plt.title('Confusion Matrix (K-Fold Train/Validation)')
 plt.show()
 
 # Simpan semua model terbaik hasil tuning K-Fold
-os.makedirs('saved_models', exist_ok=True)
 for label, model in best_models_per_label.items():
     save_model(model, f'saved_models/svm_model_label_{label}.pkl')
-
 print("\n=== All best models (from K-Fold) saved in 'saved_models/' ===")
 
-# print("\n==== FINAL EVALUATION ON TEST SET ====")
+# Final Test Evaluation
 y_test_pred = predict(X_test_vectorized, best_models_per_label)
 
 print("\n=== Final Test Classification Report ===")
@@ -168,7 +173,8 @@ print(classification_report(y_test, y_test_pred))
 
 cm_test = confusion_matrix(y_test, y_test_pred, labels=np.unique(y))
 plt.figure(figsize=(8, 6))
-sns.heatmap(cm_test, annot=True, fmt='d', cmap='Blues', xticklabels=np.unique(y), yticklabels=np.unique(y))
+sns.heatmap(cm_test, annot=True, fmt='d', cmap='Blues',
+            xticklabels=np.unique(y), yticklabels=np.unique(y))
 plt.xlabel('Predicted')
 plt.ylabel('True')
 plt.title('Confusion Matrix (Final Test Set)')
